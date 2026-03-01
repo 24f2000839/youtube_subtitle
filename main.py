@@ -1,103 +1,108 @@
-from fastapi import FastAPI, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
+import os
 import re
-import json
-import logging
+import subprocess
+import uuid
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 app = FastAPI()
 
-logging.basicConfig(level=logging.INFO)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ==========================
+# Request / Response Models
+# ==========================
+
+class AskRequest(BaseModel):
+    video_url: str
+    topic: str
+
+
+class AskResponse(BaseModel):
+    timestamp: str
+    video_url: str
+    topic: str
+
+
+# ==========================
+# Health Check (Optional)
+# ==========================
 
 @app.get("/")
-def root():
-    return {"status": "API is running"}
-
-@app.head("/")
-def root_head():
-    return {"status": "API is running"}
+def health():
+    return {"status": "running"}
 
 
-def handle_query(q: str):
-    q_lower = q.lower().strip()
+# ==========================
+# Download Subtitles
+# ==========================
 
-    # 1️⃣ Ticket Status
-    ticket_match = re.search(r"ticket\s+(\d+)", q_lower)
-    if ticket_match and "status" in q_lower:
+def download_subtitles(video_url: str, file_id: str):
+    command = [
+        "yt-dlp",
+        "--write-auto-sub",
+        "--skip-download",
+        "--sub-lang", "en",
+        "--sub-format", "vtt",
+        "-o", f"{file_id}.%(ext)s",
+        video_url
+    ]
+
+    subprocess.run(command, check=True)
+
+
+# ==========================
+# Find Timestamp in VTT
+# ==========================
+
+def find_timestamp(topic: str, file_id: str) -> str:
+    vtt_file = f"{file_id}.en.vtt"
+
+    if not os.path.exists(vtt_file):
+        raise Exception("Subtitles not available for this video")
+
+    with open(vtt_file, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    blocks = content.split("\n\n")
+
+    for block in blocks:
+        if topic.lower() in block.lower():
+            match = re.search(r"\d{2}:\d{2}:\d{2}", block)
+            if match:
+                return match.group(0)
+
+    return "00:00:00"
+
+
+# ==========================
+# POST /ask Endpoint
+# ==========================
+
+@app.post("/ask", response_model=AskResponse)
+def ask(req: AskRequest):
+
+    file_id = str(uuid.uuid4())
+
+    try:
+        # 1️⃣ Download subtitles
+        download_subtitles(req.video_url, file_id)
+
+        # 2️⃣ Search topic in transcript
+        timestamp = find_timestamp(req.topic, file_id)
+
+        # 3️⃣ Cleanup
+        for file in os.listdir():
+            if file.startswith(file_id):
+                os.remove(file)
+
         return {
-            "name": "get_ticket_status",
-            "arguments": json.dumps({
-                "ticket_id": int(ticket_match.group(1))
-            })
+            "timestamp": timestamp,
+            "video_url": req.video_url,
+            "topic": req.topic
         }
 
-    # 2️⃣ Meeting
-    meeting_match = re.search(
-        r"(\d{4}-\d{2}-\d{2}).*?(\d{2}:\d{2}).*?room\s+([a-z0-9]+)",
-        q_lower
-    )
-    if meeting_match:
-        return {
-            "name": "schedule_meeting",
-            "arguments": json.dumps({
-                "date": meeting_match.group(1),
-                "time": meeting_match.group(2),
-                "meeting_room": f"Room {meeting_match.group(3).upper()}"
-            })
-        }
+    except subprocess.CalledProcessError:
+        raise HTTPException(status_code=400, detail="Failed to download subtitles")
 
-    # 3️⃣ Expense
-    expense_match = re.search(r"employee\s+(\d+)", q_lower)
-    if expense_match and "expense" in q_lower:
-        return {
-            "name": "get_expense_balance",
-            "arguments": json.dumps({
-                "employee_id": int(expense_match.group(1))
-            })
-        }
-
-    # 4️⃣ Bonus
-    bonus_match = re.search(r"employee\s+(\d+).*?(\d{4})", q_lower)
-    if bonus_match and "bonus" in q_lower:
-        return {
-            "name": "calculate_performance_bonus",
-            "arguments": json.dumps({
-                "employee_id": int(bonus_match.group(1)),
-                "current_year": int(bonus_match.group(2))
-            })
-        }
-
-    # 5️⃣ Office Issue
-    issue_match = re.search(r"issue\s+(\d+)", q_lower)
-    dept_match = re.search(r"for\s+the\s+(.+?)\s+department", q_lower)
-    if issue_match and dept_match:
-        return {
-            "name": "report_office_issue",
-            "arguments": json.dumps({
-                "issue_code": int(issue_match.group(1)),
-                "department": dept_match.group(1).title()
-            })
-        }
-
-    # Safe fallback
-    return {
-        "name": "get_ticket_status",
-        "arguments": json.dumps({"ticket_id": 0})
-    }
-
-
-@app.get("/execute")
-def execute(q: str = Query(...)):
-    return handle_query(q)
-
-
-@app.get("/ask")
-def ask(q: str = Query(...)):
-    return handle_query(q)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
